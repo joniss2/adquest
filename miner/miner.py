@@ -40,7 +40,7 @@ class Miner:
         n = self.config.threads
         logger.info("Starte %d Worker-Thread(s)", n)
         for i in range(n):
-            w = MiningWorker(i, self.stats)
+            w = MiningWorker(i, n, self.stats)
             w.on_share_found = self._on_share_found
             w.start()
             self._workers.append(w)

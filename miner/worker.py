@@ -4,7 +4,7 @@ import struct
 import threading
 import time
 import logging
-from typing import Optional
+from typing import Optional, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -51,16 +51,17 @@ def le_hex(n: int, width: int) -> str:
 
 
 class MiningWorker(threading.Thread):
-    def __init__(self, worker_id: int, stats: "MinerStats"):
+    def __init__(self, worker_id: int, num_workers: int, stats: "MinerStats"):
         super().__init__(daemon=True, name=f"Worker-{worker_id}")
         self.worker_id = worker_id
+        self.num_workers = num_workers
         self.stats = stats
 
         self._job: Optional[dict] = None
         self._job_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._new_job_event = threading.Event()
-        self.on_share_found: Optional[callable] = None
+        self.on_share_found: Optional[Callable] = None
 
     def set_job(self, job: dict, extra_nonce1: str, extra_nonce2_size: int) -> None:
         with self._job_lock:
@@ -89,8 +90,10 @@ class MiningWorker(threading.Thread):
     def _mine(self, job: dict, extra_nonce1: str, extra_nonce2_size: int) -> None:
         target = bits_to_target(job["nbits"])
 
-        # Extra-Nonce2 enthält Worker-ID, um Nonce-Überlappung zwischen Workern zu vermeiden
+        # Jeder Worker startet bei seiner ID und springt beim Nonce-Overflow
+        # um num_workers weiter — so überlappen sich Worker niemals im Nonce-Raum.
         en2_int = self.worker_id
+        stride = self.num_workers
         extra_nonce2 = le_hex(en2_int, extra_nonce2_size)
 
         coinbase = build_coinbase(job["coinbase1"], extra_nonce1, extra_nonce2, job["coinbase2"])
@@ -104,14 +107,13 @@ class MiningWorker(threading.Thread):
         job_id = job["job_id"]
 
         nonce = 0
-        start_time = time.monotonic()
 
         while not self._new_job_event.is_set() and not self._stop_event.is_set():
             # Batch verarbeiten
             for _ in range(BATCH_SIZE):
                 if nonce > 0xFFFFFFFF:
                     nonce = 0
-                    en2_int += 1
+                    en2_int += stride
                     extra_nonce2 = le_hex(en2_int, extra_nonce2_size)
                     coinbase = build_coinbase(job["coinbase1"], extra_nonce1, extra_nonce2, job["coinbase2"])
                     coinbase_hash = double_sha256(coinbase)

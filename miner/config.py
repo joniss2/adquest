@@ -11,7 +11,7 @@ class MinerConfig:
     wallet: str = "1A1zP1eP5QGefi2DMPTfTL5SLmv7Divf"
     worker: str = "worker1"
     password: str = "x"
-    threads: int = max(1, os.cpu_count() - 1)
+    threads: int = os.cpu_count() or 1
     log_interval: int = 10  # seconds between hashrate logs
 
     @classmethod

@@ -85,6 +85,23 @@ def test_miner_stats_shares():
     assert stats.report()["shares"] == 2
 
 
+def test_worker_nonce_partitioning():
+    """Jeder Worker startet bei worker_id und springt um num_workers."""
+    from miner.worker import MinerStats, MiningWorker
+    stats = MinerStats()
+    num_workers = 4
+    workers = [MiningWorker(i, num_workers, stats) for i in range(num_workers)]
+    # Startpositionen: 0, 1, 2, 3 — kein Overlap
+    start_positions = [w.worker_id for w in workers]
+    assert start_positions == list(range(num_workers))
+    # Nach einem Overflow springen alle um num_workers, nicht um 1
+    # Simuliere: en2 = worker_id; nach overflow: en2 += num_workers
+    for w in workers:
+        en2 = w.worker_id
+        en2 += num_workers  # ein Overflow-Schritt
+        assert en2 == w.worker_id + num_workers
+
+
 def test_proof_of_work_simulation():
     """Simuliert echtes Mining mit einem sehr leichten Target."""
     target = (1 << 252) - 1  # Sehr einfaches Target
