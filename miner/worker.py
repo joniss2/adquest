@@ -1,16 +1,20 @@
 """Mining-Worker: Proof-of-Work per SHA-256 (Bitcoin-kompatibel)."""
 import hashlib
+import multiprocessing as mp
 import struct
-import threading
 import time
 import logging
 from typing import Optional, Callable
 
 logger = logging.getLogger(__name__)
 
-# Anzahl Hashes zwischen zwei Nonce-Überprüfungen
-BATCH_SIZE = 65536
+# Größeres Batch = weniger Python-Overhead pro Hash
+BATCH_SIZE = 262144
 
+
+# ---------------------------------------------------------------------------
+# Reine Hilfsfunktionen (pickleable, testbar)
+# ---------------------------------------------------------------------------
 
 def double_sha256(data: bytes) -> bytes:
     return hashlib.sha256(hashlib.sha256(data).digest()).digest()
@@ -50,123 +54,175 @@ def le_hex(n: int, width: int) -> str:
     return n.to_bytes(width, "little").hex()
 
 
-class MiningWorker(threading.Thread):
-    def __init__(self, worker_id: int, num_workers: int, stats: "MinerStats"):
-        super().__init__(daemon=True, name=f"Worker-{worker_id}")
+# ---------------------------------------------------------------------------
+# Interne Hilfsfunktionen für Worker-Prozesse
+# ---------------------------------------------------------------------------
+
+def _build_merkle(job: dict, extra_nonce1: str, en2_int: int, en2_size: int):
+    en2_hex = le_hex(en2_int, en2_size)
+    cb = build_coinbase(job["coinbase1"], extra_nonce1, en2_hex, job["coinbase2"])
+    root = build_merkle_root(double_sha256(cb), job["merkle_branch"])
+    return root, en2_hex
+
+
+def _make_prefix(job: dict, merkle_root: bytes) -> bytes:
+    """Baut die 76-Byte-Prefix des Block-Headers (alles außer dem Nonce)."""
+    return (
+        struct.pack("<I", int(job["version"], 16))
+        + bytes.fromhex(job["prev_hash"])
+        + merkle_root
+        + struct.pack("<I", int(job["ntime"], 16))
+        + struct.pack("<I", int(job["nbits"], 16))
+    )
+
+
+def _worker_process(worker_id: int, num_workers: int,
+                    job_queue: mp.Queue, share_queue: mp.Queue,
+                    hash_counter: mp.Value) -> None:
+    """Einstiegspunkt für Worker-Subprozesse (muss pickleable sein)."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"%(asctime)s  Worker-{worker_id}  %(levelname)s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    item = job_queue.get()
+    while item is not None:
+        job, extra_nonce1, en2_size = item
+        item = _mine_loop(worker_id, num_workers, job, extra_nonce1, en2_size,
+                          job_queue, share_queue, hash_counter)
+
+
+def _mine_loop(worker_id: int, num_workers: int, job: dict,
+               extra_nonce1: str, en2_size: int,
+               job_queue: mp.Queue, share_queue: mp.Queue,
+               hash_counter: mp.Value) -> Optional[tuple]:
+    """
+    Hauptschleife: SHA-256-Double-Hash mit drei Optimierungen:
+
+    1. Midstate: Der Header ist 80 Byte. SHA-256 verarbeitet 64-Byte-Blöcke.
+       Die ersten 64 Byte (version + prev_hash + merkle_root[0:28]) ändern
+       sich pro en2-Wert nicht. Der SHA-256-Zustand nach diesen 64 Byte wird
+       einmal berechnet und dann nur noch per copy() geklont — spart eine
+       vollständige 64-Byte-Block-Verarbeitung pro Hash (~33 % schneller).
+
+    2. bytearray-Nonce-Buffer: Vermeidet Speicherallokation im Hot-Loop.
+       struct.pack_into schreibt direkt in den bestehenden Buffer.
+
+    3. Größeres Batch (262144): Weniger Python-Overhead pro Hash durch
+       seltene Queue-Checks und Lock-Acquires.
+
+    Gibt das nächste Job-Tupel zurück (oder None zum Stoppen).
+    """
+    target = bits_to_target(job["nbits"])
+    en2_int = worker_id
+    stride = num_workers
+
+    merkle_root, extra_nonce2 = _build_merkle(job, extra_nonce1, en2_int, en2_size)
+    prefix = _make_prefix(job, merkle_root)
+
+    # Midstate: SHA-256-Zustand nach den ersten 64 statischen Bytes
+    midstate = hashlib.sha256()
+    midstate.update(prefix[:64])
+
+    # nonce_frame: bytes 64–75 (statisch) + bytes 76–79 (Nonce, variabel)
+    nonce_frame = bytearray(16)
+    nonce_frame[:12] = prefix[64:]
+
+    nonce = 0
+    job_id = job["job_id"]
+    ntime = job["ntime"]
+
+    while True:
+        if nonce > 0xFFFFFFFF:
+            nonce = 0
+            en2_int += stride
+            merkle_root, extra_nonce2 = _build_merkle(job, extra_nonce1, en2_int, en2_size)
+            prefix = _make_prefix(job, merkle_root)
+            midstate = hashlib.sha256()
+            midstate.update(prefix[:64])
+            nonce_frame[:12] = prefix[64:]
+
+        local_hashes = 0
+        for _ in range(BATCH_SIZE):
+            if nonce > 0xFFFFFFFF:
+                break
+
+            # Nonce in den letzten 4 Byte des Frames schreiben (keine Allokation)
+            struct.pack_into("<I", nonce_frame, 12, nonce)
+
+            # SHA-256: Midstate klonen + restliche 16 Byte verarbeiten
+            h = midstate.copy()
+            h.update(nonce_frame)
+            hash_val = hashlib.sha256(h.digest()).digest()
+
+            if int.from_bytes(hash_val[::-1], "big") < target:
+                logger.info("Worker %d: Share! Nonce=%08x", worker_id, nonce)
+                share_queue.put((job_id, extra_nonce2, ntime, f"{nonce:08x}"))
+
+            nonce += 1
+            local_hashes += 1
+
+        with hash_counter.get_lock():
+            hash_counter.value += local_hashes
+
+        try:
+            return job_queue.get_nowait()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Öffentliche API
+# ---------------------------------------------------------------------------
+
+class MiningWorker:
+    """Verwaltet einen Worker-Subprozess."""
+
+    def __init__(self, worker_id: int, num_workers: int,
+                 job_queue: mp.Queue, share_queue: mp.Queue,
+                 hash_counter: mp.Value):
         self.worker_id = worker_id
-        self.num_workers = num_workers
-        self.stats = stats
+        self._process = mp.Process(
+            target=_worker_process,
+            args=(worker_id, num_workers, job_queue, share_queue, hash_counter),
+            daemon=True,
+            name=f"Worker-{worker_id}",
+        )
 
-        self._job: Optional[dict] = None
-        self._job_lock = threading.Lock()
-        self._stop_event = threading.Event()
-        self._new_job_event = threading.Event()
-        self.on_share_found: Optional[Callable] = None
-
-    def set_job(self, job: dict, extra_nonce1: str, extra_nonce2_size: int) -> None:
-        with self._job_lock:
-            self._job = job
-            self._extra_nonce1 = extra_nonce1
-            self._extra_nonce2_size = extra_nonce2_size
-        self._new_job_event.set()
+    def start(self) -> None:
+        self._process.start()
 
     def stop(self) -> None:
-        self._stop_event.set()
-        self._new_job_event.set()
+        self._process.terminate()
 
-    def run(self) -> None:
-        while not self._stop_event.is_set():
-            self._new_job_event.wait()
-            self._new_job_event.clear()
-            if self._stop_event.is_set():
-                break
-            with self._job_lock:
-                job = self._job
-                extra_nonce1 = self._extra_nonce1
-                extra_nonce2_size = self._extra_nonce2_size
-            if job:
-                self._mine(job, extra_nonce1, extra_nonce2_size)
-
-    def _mine(self, job: dict, extra_nonce1: str, extra_nonce2_size: int) -> None:
-        target = bits_to_target(job["nbits"])
-
-        # Jeder Worker startet bei seiner ID und springt beim Nonce-Overflow
-        # um num_workers weiter — so überlappen sich Worker niemals im Nonce-Raum.
-        en2_int = self.worker_id
-        stride = self.num_workers
-        extra_nonce2 = le_hex(en2_int, extra_nonce2_size)
-
-        coinbase = build_coinbase(job["coinbase1"], extra_nonce1, extra_nonce2, job["coinbase2"])
-        coinbase_hash = double_sha256(coinbase)
-        merkle_root = build_merkle_root(coinbase_hash, job["merkle_branch"])
-
-        ntime = job["ntime"]
-        version = job["version"]
-        nbits = job["nbits"]
-        prev_hash = job["prev_hash"]
-        job_id = job["job_id"]
-
-        nonce = 0
-
-        while not self._new_job_event.is_set() and not self._stop_event.is_set():
-            # Batch verarbeiten
-            for _ in range(BATCH_SIZE):
-                if nonce > 0xFFFFFFFF:
-                    nonce = 0
-                    en2_int += stride
-                    extra_nonce2 = le_hex(en2_int, extra_nonce2_size)
-                    coinbase = build_coinbase(job["coinbase1"], extra_nonce1, extra_nonce2, job["coinbase2"])
-                    coinbase_hash = double_sha256(coinbase)
-                    merkle_root = build_merkle_root(coinbase_hash, job["merkle_branch"])
-
-                header = build_header(version, prev_hash, merkle_root, ntime, nbits, nonce)
-                hash_val = double_sha256(header)
-                hash_int = int.from_bytes(hash_val[::-1], "big")
-
-                if hash_int < target:
-                    logger.info(
-                        "Worker %d: Share gefunden! Nonce=%08x Hash=%s",
-                        self.worker_id, nonce, hash_val[::-1].hex()
-                    )
-                    if self.on_share_found:
-                        self.on_share_found(job_id, extra_nonce2, ntime, f"{nonce:08x}")
-                    self.stats.record_share()
-
-                nonce += 1
-
-            self.stats.add_hashes(BATCH_SIZE)
+    def is_alive(self) -> bool:
+        return self._process.is_alive()
 
 
 class MinerStats:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._hashes = 0
+    """Hashrate- und Share-Statistiken für den Haupt-Prozess."""
+
+    def __init__(self, hash_counter: mp.Value) -> None:
+        self._hash_counter = hash_counter
+        self._lock = __import__("threading").Lock()
         self._shares = 0
         self._start = time.monotonic()
-        self._last_report = self._start
-
-    def add_hashes(self, n: int) -> None:
-        with self._lock:
-            self._hashes += n
 
     def record_share(self) -> None:
         with self._lock:
             self._shares += 1
 
     def report(self) -> dict:
+        elapsed = time.monotonic() - self._start
+        with self._hash_counter.get_lock():
+            total = self._hash_counter.value
+        hashrate = total / elapsed if elapsed > 0 else 0
         with self._lock:
-            elapsed = time.monotonic() - self._start
-            hashrate = self._hashes / elapsed if elapsed > 0 else 0
-            return {
-                "hashrate": hashrate,
-                "total_hashes": self._hashes,
-                "shares": self._shares,
-                "elapsed": elapsed,
-            }
+            shares = self._shares
+        return {"hashrate": hashrate, "total_hashes": total, "shares": shares, "elapsed": elapsed}
 
     def hashrate_str(self) -> str:
-        r = self.report()
-        hr = r["hashrate"]
+        hr = self.report()["hashrate"]
         if hr >= 1e9:
             return f"{hr/1e9:.2f} GH/s"
         if hr >= 1e6:
