@@ -113,6 +113,12 @@ def test_midstate_matches_full_hash():
     assert naive_hash == midstate_hash
 
 
+def test_le_int_from_bytes_equivalence():
+    """int.from_bytes(h, 'little') ist äquivalent zu int.from_bytes(h[::-1], 'big')."""
+    for data in [b"\x00" * 32, double_sha256(b"test"), double_sha256(b"bitcoin")]:
+        assert int.from_bytes(data, "little") == int.from_bytes(data[::-1], "big")
+
+
 def test_miner_stats_hashrate():
     counter = mp.Value("Q", 1_000_000)
     stats = MinerStats(counter)
