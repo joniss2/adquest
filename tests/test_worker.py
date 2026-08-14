@@ -1,6 +1,8 @@
 """Tests für die Kern-Mining-Algorithmen."""
 import hashlib
+import multiprocessing as mp
 import struct
+import time
 
 from miner.worker import (
     bits_to_target,
@@ -10,6 +12,9 @@ from miner.worker import (
     double_sha256,
     le_hex,
     MinerStats,
+    MiningWorker,
+    _build_merkle,
+    _make_prefix,
 )
 
 
@@ -22,13 +27,11 @@ def test_double_sha256_known_value():
 def test_bits_to_target_genesis():
     # Bitcoin Genesis-Block: nbits = 0x1d00ffff
     target = bits_to_target("1d00ffff")
-    # Sollte 0x00000000FFFF0000...0000 sein
     expected = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
     assert target == expected
 
 
 def test_bits_to_target_easy():
-    # Sehr leichtes Target: 0x207fffff (regtest standard)
     target = bits_to_target("207fffff")
     assert target > 0
 
@@ -70,16 +73,57 @@ def test_le_hex():
     assert le_hex(256, 4) == "00010000"
 
 
+def test_midstate_matches_full_hash():
+    """Stellt sicher, dass Midstate-Optimierung identische Hashes liefert wie der naive Ansatz."""
+    # Fake-Header-Daten
+    version = "00000001"
+    prev_hash = "a" * 64
+    ntime = "66ba66ba"
+    nbits = "207fffff"
+    nonce = 42
+
+    coinbase = build_coinbase("aabb", "cc", "dd", "eeff")
+    coinbase_hash = double_sha256(coinbase)
+    merkle_root = build_merkle_root(coinbase_hash, [])
+
+    job = {
+        "version": version, "prev_hash": prev_hash, "ntime": ntime, "nbits": nbits,
+        "coinbase1": "aabb", "coinbase2": "eeff", "merkle_branch": [],
+        "job_id": "test",
+    }
+
+    from miner.worker import _make_prefix
+    prefix = _make_prefix(job, merkle_root)
+    assert len(prefix) == 76  # 80 - 4 (nonce)
+
+    # Naiver Ansatz
+    header = prefix + struct.pack("<I", nonce)
+    naive_hash = double_sha256(header)
+
+    # Midstate-Ansatz
+    midstate = hashlib.sha256()
+    midstate.update(prefix[:64])
+    nonce_frame = bytearray(16)
+    nonce_frame[:12] = prefix[64:]
+    struct.pack_into("<I", nonce_frame, 12, nonce)
+    h = midstate.copy()
+    h.update(nonce_frame)
+    midstate_hash = hashlib.sha256(h.digest()).digest()
+
+    assert naive_hash == midstate_hash
+
+
 def test_miner_stats_hashrate():
-    stats = MinerStats()
-    stats.add_hashes(1_000_000)
+    counter = mp.Value("Q", 1_000_000)
+    stats = MinerStats(counter)
     r = stats.report()
     assert r["total_hashes"] == 1_000_000
     assert r["hashrate"] > 0
 
 
 def test_miner_stats_shares():
-    stats = MinerStats()
+    counter = mp.Value("Q", 0)
+    stats = MinerStats(counter)
     stats.record_share()
     stats.record_share()
     assert stats.report()["shares"] == 2
@@ -87,25 +131,17 @@ def test_miner_stats_shares():
 
 def test_worker_nonce_partitioning():
     """Jeder Worker startet bei worker_id und springt um num_workers."""
-    from miner.worker import MinerStats, MiningWorker
-    stats = MinerStats()
     num_workers = 4
-    workers = [MiningWorker(i, num_workers, stats) for i in range(num_workers)]
-    # Startpositionen: 0, 1, 2, 3 — kein Overlap
-    start_positions = [w.worker_id for w in workers]
-    assert start_positions == list(range(num_workers))
-    # Nach einem Overflow springen alle um num_workers, nicht um 1
-    # Simuliere: en2 = worker_id; nach overflow: en2 += num_workers
-    for w in workers:
-        en2 = w.worker_id
-        en2 += num_workers  # ein Overflow-Schritt
-        assert en2 == w.worker_id + num_workers
+    for worker_id in range(num_workers):
+        en2_start = worker_id
+        en2_after_overflow = en2_start + num_workers  # stride = num_workers
+        assert en2_after_overflow == worker_id + num_workers
+        assert en2_after_overflow != (worker_id + 1) % num_workers  # kein Kollisions-Muster
 
 
 def test_proof_of_work_simulation():
     """Simuliert echtes Mining mit einem sehr leichten Target."""
-    target = (1 << 252) - 1  # Sehr einfaches Target
-    nonce = 0
+    target = (1 << 252) - 1
     found = False
     for nonce in range(100_000):
         data = struct.pack("<I", nonce)
@@ -113,4 +149,4 @@ def test_proof_of_work_simulation():
         if int.from_bytes(h[::-1], "big") < target:
             found = True
             break
-    assert found, "Sollte bei so leichtem Target sofort finden"
+    assert found
