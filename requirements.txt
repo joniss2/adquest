@@ -1,0 +1,2 @@
+# Keine externen Abhängigkeiten — nur Python-Stdlib
+# Python >= 3.10 erforderlich (union-type hints)
