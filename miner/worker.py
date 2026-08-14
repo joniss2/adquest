@@ -9,7 +9,7 @@ from typing import Optional, Callable
 logger = logging.getLogger(__name__)
 
 # Größeres Batch = weniger Python-Overhead pro Hash
-BATCH_SIZE = 262144
+BATCH_SIZE = 1_048_576
 
 
 # ---------------------------------------------------------------------------
@@ -97,19 +97,26 @@ def _mine_loop(worker_id: int, num_workers: int, job: dict,
                job_queue: mp.Queue, share_queue: mp.Queue,
                hash_counter: mp.Value) -> Optional[tuple]:
     """
-    Hauptschleife: SHA-256-Double-Hash mit drei Optimierungen:
+    Hauptschleife: SHA-256-Double-Hash mit fünf Optimierungen:
 
-    1. Midstate: Der Header ist 80 Byte. SHA-256 verarbeitet 64-Byte-Blöcke.
-       Die ersten 64 Byte (version + prev_hash + merkle_root[0:28]) ändern
-       sich pro en2-Wert nicht. Der SHA-256-Zustand nach diesen 64 Byte wird
-       einmal berechnet und dann nur noch per copy() geklont — spart eine
-       vollständige 64-Byte-Block-Verarbeitung pro Hash (~33 % schneller).
+    1. Midstate: Die ersten 64 Byte des 80-Byte-Headers sind pro en2-Wert
+       statisch. SHA-256-Zustand wird einmal berechnet und per copy() geklont.
 
-    2. bytearray-Nonce-Buffer: Vermeidet Speicherallokation im Hot-Loop.
-       struct.pack_into schreibt direkt in den bestehenden Buffer.
+    2. bytearray-Nonce-Buffer: struct.pack_into schreibt direkt in den
+       bestehenden Buffer — keine Allokation pro Nonce.
 
-    3. Größeres Batch (262144): Weniger Python-Overhead pro Hash durch
-       seltene Queue-Checks und Lock-Acquires.
+    3. Lokale Methodreferenzen: midstate.copy, hashlib.sha256 und
+       struct.pack_into werden einmal gebunden und sichern so einen
+       Attribut-Lookup pro Hash-Iteration.
+
+    4. Trailing-Zero-Precheck: Für schwierige Pool-Targets müssen die letzten
+       N Bytes des Hashes 0 sein. Ist das nicht der Fall, wird die teurere
+       int-Konvertierung übersprungen. Bei leichten Targets (z. B. Regtest)
+       ist der Precheck automatisch deaktiviert.
+
+    5. Kein per-Nonce-Überlauf-Check: batch_count wird vor dem Inner-Loop
+       berechnet — damit entfällt `if nonce > 0xFFFFFFFF` und `local_hashes += 1`
+       im Hot-Loop.
 
     Gibt das nächste Job-Tupel zurück (oder None zum Stoppen).
     """
@@ -117,14 +124,22 @@ def _mine_loop(worker_id: int, num_workers: int, job: dict,
     en2_int = worker_id
     stride = num_workers
 
+    # Konservative Untergrenze für Trailing-Zero-Bytes eines gültigen Shares.
+    # Bei leichten Targets (bit_length ≥ 256) ist _zero_check_len == 0 → deaktiviert.
+    _zero_check_len = max(0, (256 - target.bit_length()) // 8)
+    _zero_suffix = bytes(_zero_check_len)
+
+    # Hot-Loop-Globals einmalig an Locals binden
+    _pack_into = struct.pack_into
+    _sha256 = hashlib.sha256
+
     merkle_root, extra_nonce2 = _build_merkle(job, extra_nonce1, en2_int, en2_size)
     prefix = _make_prefix(job, merkle_root)
 
-    # Midstate: SHA-256-Zustand nach den ersten 64 statischen Bytes
     midstate = hashlib.sha256()
     midstate.update(prefix[:64])
+    _midstate_copy = midstate.copy
 
-    # nonce_frame: bytes 64–75 (statisch) + bytes 76–79 (Nonce, variabel)
     nonce_frame = bytearray(16)
     nonce_frame[:12] = prefix[64:]
 
@@ -140,30 +155,29 @@ def _mine_loop(worker_id: int, num_workers: int, job: dict,
             prefix = _make_prefix(job, merkle_root)
             midstate = hashlib.sha256()
             midstate.update(prefix[:64])
+            _midstate_copy = midstate.copy
             nonce_frame[:12] = prefix[64:]
 
-        local_hashes = 0
-        for _ in range(BATCH_SIZE):
-            if nonce > 0xFFFFFFFF:
-                break
+        # Batch auf Nonce-Space-Grenze begrenzen → kein Überlauf-Check im Inner-Loop nötig
+        batch_end = nonce + BATCH_SIZE
+        if batch_end > 0x100000000:
+            batch_end = 0x100000000
+        batch_count = batch_end - nonce
 
-            # Nonce in den letzten 4 Byte des Frames schreiben (keine Allokation)
-            struct.pack_into("<I", nonce_frame, 12, nonce)
-
-            # SHA-256: Midstate klonen + restliche 16 Byte verarbeiten
-            h = midstate.copy()
+        for _ in range(batch_count):
+            _pack_into("<I", nonce_frame, 12, nonce)
+            h = _midstate_copy()
             h.update(nonce_frame)
-            hash_val = hashlib.sha256(h.digest()).digest()
-
-            if int.from_bytes(hash_val[::-1], "big") < target:
-                logger.info("Worker %d: Share! Nonce=%08x", worker_id, nonce)
-                share_queue.put((job_id, extra_nonce2, ntime, f"{nonce:08x}"))
-
+            hash_val = _sha256(h.digest()).digest()
+            # int.from_bytes(..., "little") == int.from_bytes(hash_val[::-1], "big")
+            if not (_zero_check_len and hash_val[-_zero_check_len:] != _zero_suffix):
+                if int.from_bytes(hash_val, "little") < target:
+                    logger.info("Worker %d: Share! Nonce=%08x", worker_id, nonce)
+                    share_queue.put((job_id, extra_nonce2, ntime, f"{nonce:08x}"))
             nonce += 1
-            local_hashes += 1
 
         with hash_counter.get_lock():
-            hash_counter.value += local_hashes
+            hash_counter.value += batch_count
 
         try:
             return job_queue.get_nowait()
